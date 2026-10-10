@@ -77,7 +77,11 @@ MSG_TYPE_MAP = {
 OPEN_ID_MENTION_PATTERN = re.compile(r"@ou_[a-f0-9]+")
 # 终止标签（写法对齐 @ 标签）：<stop></stop> / <stop/> 表示全局静默；
 # <stop name="A"></stop> 表示仅对名为 A 的对象静默。兼容自闭合、任意属性、大小写。
-STOP_TAG_PATTERN = re.compile(r"<\s*stop\b[^>]*?(?:/\s*>|>)", re.IGNORECASE)
+# 必须连同 </stop> 一起匹配：否则 sub 后会残留闭合标签，使「纯 stop 回复」被误判为非空而照常发送。
+STOP_TAG_PATTERN = re.compile(
+    r"<\s*stop\b[^>]*?(?:/\s*>|>(?:.*?</\s*stop\s*>)?)",
+    re.IGNORECASE | re.DOTALL,
+)
 # 从终止标签中提取 name 属性值（允许带引号或不带引号）。
 STOP_NAME_ATTR_PATTERN = re.compile(r"""name\s*=\s*["']?\s*([^"'\s>]+)""", re.IGNORECASE)
 # 模型输出里的「按显示名 @」占位：<at name=成员名></at>，用于替换成真实 open_id。
@@ -644,7 +648,15 @@ class FeishuChannel(BaseChannel):
             # 终止标签：仅当回复除 <stop> 标签外没有其它内容（自我静默）时整条不发送；
             # 带 name 的标签表示「仅指定对象静默」，需随消息发出，供接收方判断是否自我静默。
             if STOP_TAG_PATTERN.search(cleaned_content):
-                if not STOP_TAG_PATTERN.sub("", cleaned_content).strip() and not images:
+                has_named_stop = any(
+                    STOP_NAME_ATTR_PATTERN.search(m.group(0))
+                    for m in STOP_TAG_PATTERN.finditer(cleaned_content)
+                )
+                if (
+                    not STOP_TAG_PATTERN.sub("", cleaned_content).strip()
+                    and not images
+                    and not has_named_stop
+                ):
                     logger.info(
                         f"[FEISHU_STOP] self-silence reply (only stop tag), skip sending: "
                         f"session={msg.session_key}"
@@ -669,6 +681,19 @@ class FeishuChannel(BaseChannel):
             mention_prefix = ""
             if reply_to_message_id and original_sender_id and chat_type == "group":
                 mention_prefix = f'<at id="{original_sender_id}"></at>'
+
+            # 正文为空（例如只剩终止标签）且原发送者是机器人时，禁止发送纯 @ 卡片：
+            # 这类消息会 @ 到对方并再次触发处理，形成机器人互刷死循环。
+            if (
+                not content_with_mentions.strip()
+                and not images
+                and msg.metadata.get("sender_type") == "bot"
+            ):
+                logger.info(
+                    f"[FEISHU_STOP] empty body in bot-to-bot reply, skip sending: "
+                    f"session={msg.session_key}"
+                )
+                return False
 
             if content_with_mentions.strip():
                 md_content = (
@@ -1170,9 +1195,13 @@ class FeishuChannel(BaseChannel):
                 try:
                     await client.mkdir(root_uri)
                 except Exception as e:
-                    logger.warning(
-                        f"[FEISHU_MENTION] mkdir {root_uri} failed: {e}"
-                    )
+                    # 目录已存在时服务端会直接报 already exists，属于正常情况，不告警。
+                    if "already exists" in str(e).lower():
+                        logger.debug(f"[FEISHU_MENTION] mkdir {root_uri} already exists")
+                    else:
+                        logger.warning(
+                            f"[FEISHU_MENTION] mkdir {root_uri} failed: {e}"
+                        )
                 # memories 不支持二进制写入，必须走纯文本 content（不能用 content_base64）。
                 await client.batch_write(
                     root_uri=root_uri,
@@ -1585,6 +1614,7 @@ class FeishuChannel(BaseChannel):
                     "chat_mode": chat_mode,
                     "topic_title": topic_title if isinstance(topic_title, str) else "",
                     "sender_id": sender_id,
+                    "sender_type": getattr(sender, "sender_type", None),
                 },
             )
 
