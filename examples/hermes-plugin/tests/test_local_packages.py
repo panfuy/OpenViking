@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import pytest
+from packaging.tags import Tag
 
 
 @pytest.fixture
@@ -83,7 +84,12 @@ def test_bad_hash_never_reaches_pm(external_provider, tmp_path, wheel_source, mo
     monkeypatch.setattr(ql, "_pm_available", lambda: True)
     monkeypatch.setattr(ql, "openviking_install_satisfies_requirement", lambda _paths: False)
     monkeypatch.setattr(
-        packages, "install_requirements", lambda **_kw: [f"probe @ {url}#sha256={'0' * 64}"]
+        packages,
+        "install_requirements",
+        lambda **_kw: [ql.OPENVIKING_REQUIREMENT, f"probe @ {url}#sha256={'0' * 64}"],
+    )
+    monkeypatch.setattr(
+        packages, "resolve_server_requirement", lambda **_kw: "openviking[local-embed]==0.5.0"
     )
     install = MagicMock()
     monkeypatch.setattr(pm, "ensure_python_tool", install)
@@ -92,3 +98,93 @@ def test_bad_hash_never_reaches_pm(external_provider, tmp_path, wheel_source, mo
         engine._ensure_openviking_installed(ql.managed_paths(home))
     install.assert_not_called()
     assert not (ql.managed_paths(home).root / "runtime-requirements.json").exists()
+
+
+def _distribution(version, *, tag="py3-none-any", **changes):
+    filename = f"openviking-{version}-{tag}.whl"
+    return {
+        "filename": filename,
+        "url": f"https://files.pythonhosted.org/packages/{filename}",
+        "digests": {"sha256": "a" * 64},
+        "packagetype": "bdist_wheel",
+        "requires_python": ">=3.11",
+        "yanked": False,
+        **changes,
+    }
+
+
+def test_server_selection_uses_latest_compatible_stable_wheel(external_provider):
+    _h, _p, module, _s = external_provider("releases")
+    packages = importlib.import_module(module.__name__ + ".local_packages")
+    releases = {
+        "0.4.21": [_distribution("0.4.21")],
+        "0.4.22": [_distribution("0.4.22")],
+        "0.4.23": [_distribution("0.4.23")],
+        "0.5.0": [_distribution("0.5.0", tag="cp310-abi3-manylinux_2_31_x86_64")],
+        "0.5.1": [_distribution("0.5.1", requires_python="<3.14")],
+        "0.5.2": [_distribution("0.5.2", yanked=True)],
+        "0.5.3rc1": [_distribution("0.5.3rc1")],
+        "0.6.0": [_distribution("0.6.0")],
+    }
+    selected = packages._select_server_requirement(
+        releases,
+        python_version="3.14.0",
+        tags=[Tag("cp310", "abi3", "manylinux_2_31_x86_64"), Tag("py3", "none", "any")],
+    )
+    assert selected == (
+        "openviking[local-embed] @ https://files.pythonhosted.org/packages/"
+        "openviking-0.5.0-cp310-abi3-manylinux_2_31_x86_64.whl#sha256=" + "a" * 64
+    )
+
+
+def test_source_build_requires_explicit_consent(external_provider):
+    _h, _p, module, _s = external_provider("releases")
+    packages = importlib.import_module(module.__name__ + ".local_packages")
+    ql = importlib.import_module(module.__name__ + ".quick_local")
+    releases = {"0.5.0": [_distribution("0.5.0", packagetype="sdist")]}
+    with pytest.raises(ql.QuickLocalSetupError, match="No compatible"):
+        packages._select_server_requirement(releases, python_version="3.14", tags=[])
+    assert (
+        packages._select_server_requirement(
+            releases, python_version="3.14", tags=[], allow_source_build=True
+        )
+        == "openviking[local-embed]==0.5.0"
+    )
+
+
+def test_pypi_failure_is_reported_without_installation(external_provider, monkeypatch):
+    import httpx
+
+    _h, _p, module, _s = external_provider("releases")
+    packages = importlib.import_module(module.__name__ + ".local_packages")
+    ql = importlib.import_module(module.__name__ + ".quick_local")
+    monkeypatch.setattr(
+        packages.httpx,
+        "get",
+        lambda *_a, **_kw: httpx.Response(503, request=httpx.Request("GET", "https://pypi.org")),
+    )
+    with pytest.raises(ql.QuickLocalSetupError, match="check OpenViking releases"):
+        packages.resolve_server_requirement()
+
+
+def test_each_setup_resolves_new_pypi_release(external_provider, monkeypatch):
+    import httpx
+
+    _h, _p, module, _s = external_provider("releases")
+    packages = importlib.import_module(module.__name__ + ".local_packages")
+    versions = iter(["0.5.0", "0.5.1"])
+    requests = []
+
+    def respond(url, **kwargs):
+        requests.append((url, kwargs))
+        version = next(versions)
+        return httpx.Response(
+            200,
+            json={"releases": {version: [_distribution(version)]}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(packages.httpx, "get", respond)
+    assert "openviking-0.5.0-" in packages.resolve_server_requirement()
+    assert "openviking-0.5.1-" in packages.resolve_server_requirement()
+    assert requests == [("https://pypi.org/pypi/openviking/json", {"timeout": 30})] * 2

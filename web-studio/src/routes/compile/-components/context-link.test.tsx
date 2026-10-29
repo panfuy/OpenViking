@@ -19,10 +19,16 @@ const api = vi.hoisted(() => ({
   fetchCompileSkills: vi.fn(),
   fetchFsStat: vi.fn(),
 }))
-vi.mock('../-lib/api', () => ({ fetchCompileSkills: api.fetchCompileSkills }))
+vi.mock('../-lib/api', () => ({
+  BUILTIN_SKILLS_ROOT: 'viking://system/compile/example-skills',
+  fetchCompileSkills: api.fetchCompileSkills,
+}))
 vi.mock('#/routes/resources/-lib/api', () => ({ fetchFsStat: api.fetchFsStat }))
 vi.mock('#/hooks/use-app-connection', () => ({
-  useAppConnection: () => ({ identityScopeKey: 'alice' }),
+  useAppConnection: () => ({
+    identityScopeKey: 'alice',
+    connection: { userId: 'alice' },
+  }),
 }))
 vi.mock('@tanstack/react-router', () => ({
   Link: ({
@@ -66,7 +72,7 @@ it('opens file materials in preview and directory materials in the explorer', as
       page.getByRole('link', { name: 'report.md' }).getAttribute('href')!,
       'http://localhost',
     )
-    expect(link.pathname).toBe('/playground')
+    expect(link.pathname).toBe('/filesystem')
     expect(link.searchParams.get('file')).toBe(
       'viking://resources/folder/report.md',
     )

@@ -1,5 +1,9 @@
+import i18n from '#/i18n/core'
 import { getOvResult, ovClient, OvClientError } from '#/lib/ov-client'
 import type { TaskRecord } from '#/routes/tasks/-lib/task-record'
+import { parse as parseYaml } from 'yaml'
+import { splitMarkdownFrontmatter } from '#/lib/markdown-frontmatter'
+import { normalizeReadContent } from '#/routes/resources/-lib/normalize'
 
 export type CompileRequest = {
   from: string[]
@@ -12,10 +16,25 @@ export type CompileTask = TaskRecord & {
   task_id: string
   meta?: { request?: CompileRequest }
 }
+type CompileTaskPayload = Omit<CompileTask, 'meta'> & {
+  meta?: {
+    request?: Omit<CompileRequest, 'from'> & { from?: string[] | null }
+  }
+}
 export type TaskPage = {
   items: CompileTask[]
   next_cursor: string | null
   has_more: boolean
+}
+type TaskPagePayload = Omit<TaskPage, 'items'> & { items: CompileTaskPayload[] }
+
+const normalizeCompileTask = (task: CompileTaskPayload): CompileTask => {
+  const request = task.meta?.request
+  if (!request) return task as CompileTask
+  return {
+    ...task,
+    meta: { ...task.meta, request: { ...request, from: request.from ?? [] } },
+  }
 }
 export const active = (status?: string) =>
   ['pending', 'running', 'cancelling'].includes(status ?? '')
@@ -33,7 +52,7 @@ export async function fetchCompileTasks(
   cursor?: string,
   signal?: AbortSignal,
 ) {
-  const page = await getOvResult<TaskPage>(
+  const page = await getOvResult<TaskPagePayload>(
     ovClient.client.get({
       url: '/api/v1/tasks',
       signal,
@@ -50,53 +69,67 @@ export async function fetchCompileTasks(
   if (!Array.isArray(page.items))
     throw new OvClientError({
       code: 'PAGINATION_UNSUPPORTED',
-      message:
-        'The server does not support paginated tasks. Update OpenViking and retry.',
+      message: i18n.t('compile:errors.upgrade'),
     })
-  return page
+  return { ...page, items: page.items.map(normalizeCompileTask) }
 }
-export function fetchCompileTask(id: string, signal?: AbortSignal) {
-  return getOvResult<CompileTask>(
-    ovClient.client.get({
-      url: `/api/v1/tasks/${encodeURIComponent(id)}`,
-      signal,
-      query: { include_events: true },
-    }),
+export async function fetchCompileTask(id: string, signal?: AbortSignal) {
+  return normalizeCompileTask(
+    await getOvResult<CompileTaskPayload>(
+      ovClient.client.get({
+        url: `/api/v1/tasks/${encodeURIComponent(id)}`,
+        signal,
+        query: { include_events: true },
+      }),
+    ),
   )
 }
-export function createCompile(body: CompileRequest, key: string) {
-  return getOvResult<CompileTask>(
-    ovClient.client.post({
-      url: '/api/v1/compile',
-      body,
-      headers: { 'Idempotency-Key': key },
-    }),
+export async function createCompile(body: CompileRequest, key: string) {
+  return normalizeCompileTask(
+    await getOvResult<CompileTaskPayload>(
+      ovClient.client.post({
+        url: '/api/v1/compile',
+        body,
+        headers: { 'Idempotency-Key': key },
+      }),
+    ),
   )
 }
-export function cancelCompile(id: string) {
-  return getOvResult<CompileTask>(
-    ovClient.client.post({
-      url: `/api/v1/tasks/${encodeURIComponent(id)}/cancel`,
-    }),
+export async function cancelCompile(id: string) {
+  return normalizeCompileTask(
+    await getOvResult<CompileTaskPayload>(
+      ovClient.client.post({
+        url: `/api/v1/tasks/${encodeURIComponent(id)}/cancel`,
+      }),
+    ),
   )
 }
-export function fetchCapabilities() {
+export function fetchCapabilities(signal?: AbortSignal) {
   return getOvResult<{
     configured: boolean
     can_create: boolean
     reason_code?: string
-  }>(ovClient.client.get({ url: '/api/v1/compile/capabilities' }))
+  }>(ovClient.client.get({ url: '/api/v1/compile/capabilities', signal }))
 }
-export function lookupSubmission(key: string) {
-  return getOvResult<CompileTask>(
-    ovClient.client.get({
-      url: `/api/v1/compile/submissions/${encodeURIComponent(key)}`,
-    }),
+export async function lookupSubmission(key: string) {
+  return normalizeCompileTask(
+    await getOvResult<CompileTaskPayload>(
+      ovClient.client.get({
+        url: `/api/v1/compile/submissions/${encodeURIComponent(key)}`,
+      }),
+    ),
   )
 }
-export type CompileSkill = { name: string; uri: string; description: string }
+export const BUILTIN_SKILLS_ROOT = 'viking://system/compile/example-skills'
+export type CompileSkill = {
+  name: string
+  uri: string
+  description: string
+  metadataError?: boolean
+}
 export async function fetchCompileSkills(
   signal?: AbortSignal,
+  targetUri?: string,
 ): Promise<CompileSkill[]> {
   const result = await getOvResult<{
     skills: Array<{
@@ -105,9 +138,61 @@ export async function fetchCompileSkills(
       root_uri?: string
       description?: string
     }>
-  }>(ovClient.client.get({ url: '/api/v1/skills', signal }))
-  return result.skills.flatMap((s) => {
+  }>(
+    ovClient.client.get({
+      url: '/api/v1/skills',
+      signal,
+      ...(targetUri ? { query: { target_uri: targetUri } } : {}),
+    }),
+  )
+  const skills = result.skills.flatMap((s) => {
     const uri = s.uri || s.root_uri
     return uri ? [{ name: s.name, uri, description: s.description || '' }] : []
   })
+  if (targetUri !== BUILTIN_SKILLS_ROOT) return skills
+  signal?.throwIfAborted()
+  // System assets are file-only: their descriptions do not have abstract sidecars.
+  // Read the definition supplied by this server, including skills unknown to Studio.
+  return Promise.all(
+    skills.map(async (skill): Promise<CompileSkill> => {
+      if (skill.description) return skill
+      try {
+        const content = await getOvResult<unknown>(
+          ovClient.client.get({
+            url: '/api/v1/content/read',
+            signal,
+            query: {
+              uri: `${skill.uri.replace(/\/$/, '')}/SKILL.md`,
+              limit: 100,
+            },
+          }),
+        )
+        const frontmatter = splitMarkdownFrontmatter(
+          normalizeReadContent(content),
+        )
+        const meta = frontmatter
+          ? parseYaml(
+              frontmatter.rawFrontmatter.split('\n').slice(1, -1).join('\n'),
+            )
+          : null
+        if (
+          !meta ||
+          typeof meta.description !== 'string' ||
+          !meta.description.trim()
+        )
+          return { ...skill, metadataError: true }
+        return {
+          ...skill,
+          name:
+            typeof meta.name === 'string' && meta.name.trim()
+              ? meta.name
+              : skill.name,
+          description: meta.description,
+        }
+      } catch (error) {
+        if (signal?.aborted) throw error
+        return { ...skill, metadataError: true }
+      }
+    }),
+  )
 }

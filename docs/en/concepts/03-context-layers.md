@@ -4,7 +4,7 @@ OpenViking uses abstracts and overviews to locate content, then loads the body w
 
 ## Overview
 
-| Layer | Name | Storage | Default body limit | Purpose |
+| Layer | Name | Storage | Default generated-body budget | Purpose |
 | --- | --- | --- | --- | --- |
 | **L0** | Abstract | `.abstract.md` in a directory | 256 characters | Vector retrieval, quick filtering |
 | **L1** | Overview | `.overview.md` in a directory | 4000 characters | Rerank, content navigation |
@@ -14,7 +14,9 @@ L0 and L1 are **directory-level semantic sidecars**. They describe a directory; 
 
 L0 and L1 are normally generated together, but either one may exist independently. For example, `mkdir()` initially creates only L0: it uses the directory name as the default body when `description` is omitted, or the provided description otherwise. A directory with `.abstract.md` but no `.overview.md` is therefore valid. Reads and vector rebuilds process only the levels that actually exist.
 
-The body limits are configured by `semantic.abstract_max_chars` and `semantic.overview_max_chars`; the table shows their defaults. These limits apply to the Markdown body only and do not truncate sidecar metadata.
+For resource-directory summary generation, `semantic.abstract_max_chars` and `semantic.overview_max_chars` set character budgets; the table shows their defaults. The budgets apply to the generated Markdown body. Sidecar metadata is excluded.
+
+Truncation prefers complete sentences. If no sentence ends within the budget, it can retain the first complete sentence even when that sentence is longer. These settings therefore do not impose hard size limits on stored sidecars.
 
 ## L0: Abstract
 
@@ -146,7 +148,7 @@ API authentication guide covering OAuth 2.0, JWT tokens, and API keys.
 - `unsampled_entries`: direct entries not sampled, with `sampled + unsampled = total`.
 - `pending_child_changes`: direct-child change events not yet reflected in the current body (repeated changes to one child count separately).
 
-When the direct-entry count exceeds `semantic.overview_sample_limit` (32 by default), OpenViking uses deterministic, order-preserving stable sampling. Repeated refreshes of an unchanged tree choose the same sample, reducing differences caused by sampling. Model-generated text can still change between refreshes.
+Summary generation collects all direct-child summaries without a count cap. The existing overview budget remains 60000 characters by default; oversized summary inputs are batched or truncated. `semantic.overview_sample_limit` remains only a small-directory threshold for freshness scheduling.
 
 `pending_child_changes > 0` means the body is still readable but is known to lag behind lower-level changes. A successful parent refresh resets the value to 0 as part of the new coverage metadata.
 

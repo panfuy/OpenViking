@@ -74,7 +74,7 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   ok=self.path=='/health' or self.headers.get('X-API-Key')==key
   self.send_response(200 if ok else 401);self.end_headers()
-  self.wfile.write(json.dumps({'status':'ok','healthy':True,'version':'0.4.22','auth_mode':'trusted','root_api_key_required':True}).encode())
+  self.wfile.write(json.dumps({'status':'ok','healthy':True,'version':'0.5.0','auth_mode':'trusted','root_api_key_required':True}).encode())
 # Match asyncio/Uvicorn: Windows listeners do not share an active address.
 HTTPServer.allow_reuse_address = os.name != 'nt'
 HTTPServer((a.host,a.port),Handler).serve_forever()
@@ -176,6 +176,102 @@ def test_restart_keeps_data_and_changes_only_owned_process(servers):
     assert b.status()["pid"] == old_b
     assert marker.read_text() == "keep"
     assert not a.paths.restart_required_marker.exists()
+
+
+@pytest.mark.parametrize("failure_stage", ["validation", "port"])
+def test_runtime_upgrade_retries_restart_after_failed_setup(
+    servers, modules, monkeypatch, capsys, failure_stage
+):
+    from argparse import Namespace
+
+    _home, provider, _module, ql, _lifecycle, packages = modules
+    server = servers("upgrade-retry")
+    ready(server)
+    home = server.paths.root.parent
+    cli = importlib.import_module(ql.__package__ + ".cli")
+    monkeypatch.setattr(cli, "get_hermes_home", lambda: home)
+    old_pid = server.status()["pid"]
+    assert server.status()["runtime_validation_pending"] is False
+    endpoint = server.status()["endpoint"]
+    saved = {
+        path: path.read_bytes() for path in (server.paths.server_config, server.paths.ovcli_config)
+    }
+    server.paths.workspace.mkdir()
+    data = server.paths.workspace / "retained-memory"
+    data.write_text("keep")
+    monkeypatch.setattr(ql, "resolve_hermes_vlm_config", lambda: server._config()["vlm"])
+    monkeypatch.setattr(ql, "openviking_install_satisfies_requirement", lambda _paths: True)
+    monkeypatch.setattr(packages, "verified_requirements", lambda values, _cache: values)
+    monkeypatch.setattr(
+        packages, "resolve_server_requirement", lambda **_kw: "openviking[local-embed]==0.5.0"
+    )
+    install = MagicMock()
+    validate = MagicMock()
+    monkeypatch.setattr(ql.QuickLocalSetup, "_install_with_uv", install)
+    monkeypatch.setattr(ql.QuickLocalSetup, "_validate_generated_config", validate)
+
+    with monkeypatch.context() as failed:
+        if failure_stage == "validation":
+            validate.side_effect = ql.QuickLocalSetupError("validation failed")
+            error = "validation failed"
+        else:
+            failed.setattr(ql, "find_available_port", lambda: None)
+            error = "No free port"
+        setup = ql.QuickLocalSetup(health_check=lambda _url: (True, ""))
+        with pytest.raises(ql.QuickLocalSetupError, match=error):
+            setup.provision(hermes_home=home)
+
+    status = server.status()
+    assert status["pid"] == old_pid
+    assert status["state"] == "ready"
+    assert status["runtime_validation_pending"] is True
+    assert status["restart_required"] is False
+    cli._run(Namespace(local_action="status"))
+    output = capsys.readouterr().out
+    assert "Quick Local: ready" in output
+    assert "Runtime update needs validation" in output
+    assert "hermes memory setup openviking" in output
+    assert "choose Quick Local" in output
+    assert "hermes openviking local restart" not in output
+    assert server.status()["pid"] == old_pid
+    assert all(path.read_bytes() == value for path, value in saved.items())
+    assert (server.paths.root / "runtime-requirements.json").is_file()
+    provider._profile_config_and_env = lambda: ({"deployment": ql.DEPLOYMENT}, {})
+    provider.initialize("after-failed-setup", hermes_home=str(home), platform="cli")
+    assert server.status()["pid"] == old_pid
+    assert provider._ensure_client() is not None
+    assert server.paths.runtime_validation_pending_marker.is_file()
+    assert not server.paths.restart_required_marker.exists()
+
+    def validate_pending_runtime(**_kwargs):
+        assert server.paths.runtime_validation_pending_marker.is_file()
+        assert not server.paths.restart_required_marker.exists()
+        assert provider._ensure_client() is not None
+        assert server.status()["pid"] == old_pid
+
+    validate.side_effect = validate_pending_runtime
+    validate.reset_mock()
+    progress = []
+    retry = ql.QuickLocalSetup(health_check=lambda _url: (True, ""), progress=progress.append)
+    assert retry.provision(hermes_home=home).endpoint == endpoint
+    assert progress[-1].message == "Quick Local is ready with the updated settings."
+    validate.assert_called_once()
+    assert install.call_count == 1
+    new_pid = server.status()["pid"]
+    assert new_pid != old_pid
+    assert not server.paths.restart_required_marker.exists()
+    assert not server.paths.runtime_validation_pending_marker.exists()
+    assert server.status()["runtime_validation_pending"] is False
+    cli._run(Namespace(local_action="status"))
+    output = capsys.readouterr().out
+    assert "Quick Local: ready" in output
+    assert "Runtime update needs validation" not in output
+    assert all(path.read_bytes() == value for path, value in saved.items())
+    assert data.read_text() == "keep"
+    retry.provision(hermes_home=home)
+    assert server.status()["pid"] == new_pid
+    assert install.call_count == 1
+    validate.assert_called_once()
 
 
 def test_foreign_saved_port_moves_endpoint_without_stopping_foreign_server(servers):
@@ -493,16 +589,17 @@ def test_port_probe_rejects_active_listener(modules):
     "system,machine",
     [("Darwin", "arm64"), ("Linux", "x86_64"), ("Linux", "aarch64"), ("Windows", "AMD64")],
 )
-def test_supported_binary_requirements_pin_both_archives_by_hash(
+def test_supported_binary_requirements_keep_native_embedding_hash(
     modules, monkeypatch, system, machine
 ):
-    _home, _p, _m, _ql, _life, packages = modules
+    _home, _p, _m, ql, _life, packages = modules
     monkeypatch.setattr(packages.platform, "system", lambda: system)
     monkeypatch.setattr(packages.platform, "machine", lambda: machine)
     monkeypatch.setattr(packages.platform, "mac_ver", lambda: ("14.0", (), ""))
     monkeypatch.setattr(packages.platform, "libc_ver", lambda: ("glibc", "2.31"))
     requirements = packages.install_requirements()
-    assert all("#sha256=" in requirement for requirement in requirements[:2])
+    assert requirements[0] == ql.OPENVIKING_REQUIREMENT
+    assert "#sha256=" in requirements[1]
     assert "metal" in requirements[1] if system == "Darwin" else "metal" not in requirements[1]
 
 
@@ -653,11 +750,16 @@ def test_changed_native_pins_reinstall_an_existing_runtime(modules, monkeypatch)
     monkeypatch.setattr(ql, "openviking_install_satisfies_requirement", lambda _paths: True)
     monkeypatch.setattr(ql, "_pm_available", lambda: False)
     monkeypatch.setattr(packages, "verified_requirements", lambda values, _cache: values)
+    monkeypatch.setattr(
+        packages, "resolve_server_requirement", lambda **_kw: "openviking[local-embed]==0.5.0"
+    )
     engine = ql.QuickLocalSetup(health_check=lambda _url: (False, ""))
     install = MagicMock()
     monkeypatch.setattr(engine, "_install_with_uv", install)
     assert engine._ensure_openviking_installed(paths)
-    install.assert_called_once_with(paths, packages.install_requirements())
+    requirements = packages.install_requirements()
+    requirements[0] = packages.resolve_server_requirement()
+    install.assert_called_once_with(paths, requirements)
     assert not engine._ensure_openviking_installed(paths)
     assert install.call_count == 1
 

@@ -103,6 +103,11 @@ export const SKILL_TARGETS = [
   },
   {
     skill: "openviking-memory",
+    dir: join(ROOT, "examples", "agent-hook-plugin", "hosts", "codebuddy", "skills"),
+    committed: true,
+  },
+  {
+    skill: "openviking-memory",
     dir: join(ROOT, "examples", "dsh-memory-plugin", "skills"),
     committed: true,
   },
@@ -132,6 +137,11 @@ export const SKILL_TARGETS = [
   {
     skill: "openviking-skills",
     dir: join(ROOT, "examples", "agent-hook-plugin", "hosts", "cursor", "skills"),
+    committed: true,
+  },
+  {
+    skill: "openviking-skills",
+    dir: join(ROOT, "examples", "agent-hook-plugin", "hosts", "codebuddy", "skills"),
     committed: true,
   },
   {
@@ -175,7 +185,17 @@ export const SKILL_TARGETS = [
   },
   {
     skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "openclaw-plugin", "skills"),
+    committed: true,
+  },
+  {
+    skill: "ov-experience-memory",
     dir: join(ROOT, "examples", "agent-hook-plugin", "hosts", "cursor", "skills"),
+    committed: true,
+  },
+  {
+    skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "agent-hook-plugin", "hosts", "codebuddy", "skills"),
     committed: true,
   },
   {
@@ -310,6 +330,21 @@ export async function assembledClosure() {
   return sharedClosure([...seeds]);
 }
 
+/**
+ * Whether TypeScript in the plugin imports the shared copies, so they need
+ * their `.d.mts` declarations. TypeScript that imports none of them (a Claude
+ * Code hooks module beside plain `.mjs` hooks) does not make the target typed.
+ */
+async function importsFromTypeScript(files, dir) {
+  for (const file of files) {
+    if (!file.endsWith(".ts") && !file.endsWith(".mts") && !file.endsWith(".tsx")) continue;
+    for (const spec of importSpecifiers(await readFile(file, "utf-8"))) {
+      if (spec.startsWith(".") && resolvePath(dirname(file), spec).startsWith(dir + sep)) return true;
+    }
+  }
+  return false;
+}
+
 /** Every target with the file set its own imports resolve to. */
 export async function resolveTargets() {
   const resolved = [];
@@ -323,7 +358,7 @@ export async function resolveTargets() {
     resolved.push({
       ...target,
       files: await sharedClosure(seeds),
-      typed: own.some((file) => file.endsWith(".ts") || file.endsWith(".mts")),
+      typed: await importsFromTypeScript(own, target.dir),
     });
   }
   return resolved;

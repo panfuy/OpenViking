@@ -74,6 +74,7 @@ export interface RequestOptions {
 /** Options shared by asynchronous processing APIs. */
 export interface WaitOptions {
   wait?: boolean;
+  /** @deprecated Accepted for compatibility and ignored. */
   timeout?: number;
   telemetry?: unknown;
 }
@@ -118,9 +119,14 @@ export interface BatchWriteOperation {
   content?: string;
   contentBase64?: string;
   mode?: "replace" | "append" | "create" | "upsert";
+  tags?: string[];
+  tagMode?: "replace" | "append" | "clear";
+  acl?: AclSpec;
 }
 /** Batch-write request options. */
 export interface BatchWriteOptions extends WaitOptions {
+  deferProcessing?: boolean;
+  processingMode?: ProcessingMode;
   extra?: JsonObject;
 }
 /** Compile request options. */
@@ -304,6 +310,8 @@ export interface BatchAddMessagesOptions {
 }
 /** Session commit and turn-retention options. */
 export interface CommitSessionOptions {
+  /** Override only Working Memory for this commit; null inherits the session policy. */
+  enableWorkingMemory?: boolean | null;
   keepRecentCount?: number;
   retentionMode?: "turn_budget";
   keepRecentTurnCount?: number;
